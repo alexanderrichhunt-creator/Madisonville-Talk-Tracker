@@ -1,0 +1,18 @@
+# Headless settings let Render boot Streamlit without the first-run prompt.
+# The calendar markup already uses a light palette.
+
+[browser]
+gatherUsageStats = false
+
+[server]
+headless = true
+enableCORS = false
+enableXsrfProtection = false
+
+[theme]
+base = "light"
+primaryColor = "#1a73e8"
+backgroundColor = "#ffffff"
+secondaryBackgroundColor = "#f8f9fa"
+textColor = "#202124"
+font = "sans serif"

@@ -1,9 +1,25 @@
-import streamlit as st
-import pandas as pd
-from datetime import datetime, timedelta
-import gspread
-from google.oauth2.service_account import Credentials
+import html
 import calendar as cal_module
+from datetime import date, datetime, timedelta
+
+import pandas as pd
+import streamlit as st
+
+from tracker_store import (
+    EventValidationError,
+    SpreadsheetMissing,
+    StoreError,
+    build_store,
+    describe_day,
+    event_span,
+    events_on_day,
+    events_overlapping,
+    format_span_label,
+    inclusive_day_count,
+    month_bounds,
+    titles_on_day,
+    to_date,
+)
 
 # Force light theme look
 st.set_page_config(page_title="Madisonville Branch Talk Scheduler", layout="wide", page_icon="🏛️")
@@ -15,20 +31,39 @@ st.markdown("""
     .stButton>button {font-size: 20px; height: 55px; width: 100%; background-color: #1a73e8; color: white; border-radius: 8px;}
     .success-msg {font-size: 24px; color: #137333; font-weight: bold;}
     .calendar-day {
-        border: 2px solid #dadce0; 
-        padding: 10px; 
-        min-height: 145px; 
-        font-size: 15px; 
+        border: 2px solid #dadce0;
+        padding: 10px;
+        min-height: 145px;
+        font-size: 15px;
         background-color: #ffffff;
         border-radius: 8px;
         box-shadow: 0 1px 2px rgba(0,0,0,0.1);
         text-align: center;
+        overflow-wrap: anywhere;
     }
     .has-talk {background-color: #e8f0fe !important; border-color: #1a73e8;}
+    .has-event {background-color: #f0faf4 !important; border-color: #137333;}
     .fast-sunday {background-color: #fef7e0 !important; border-color: #fbbc04;}
     .date-number {font-size: 20px; font-weight: bold; color: #202124; display: block; margin-bottom: 4px;}
     .speaker {font-size: 15px; color: #1a73e8; line-height: 1.3;}
     .open-text {font-size: 14px; color: #5f6368;}
+    .event-name {
+        display: block;
+        font-size: 13px;
+        font-weight: 600;
+        color: #137333;
+        background-color: #e6f4ea;
+        border-radius: 4px;
+        margin-top: 4px;
+        padding: 2px 4px;
+        line-height: 1.25;
+    }
+    .event-range {
+        display: block;
+        font-size: 11px;
+        font-weight: 500;
+        color: #137333;
+    }
     </style>
 """, unsafe_allow_html=True)
 
@@ -36,67 +71,261 @@ st.title("🏛️ Madisonville Branch")
 st.markdown('<p class="big-font">Sacrament Talk Scheduler</p>', unsafe_allow_html=True)
 st.caption("Clean & Simple • Designed for the Branch Presidency")
 
-# ====================== GOOGLE SHEET CONNECTION ======================
-@st.cache_resource
-def get_google_client():
-    creds = Credentials.from_service_account_file(
-        "credentials.json",
-        scopes=["https://spreadsheets.google.com/feeds", "https://www.googleapis.com/auth/drive"]
-    )
-    return gspread.authorize(creds)
 
-client = get_google_client()
-SPREADSHEET_NAME = "Branch Talk Tracker"
+@st.cache_resource
+def get_cached_store():
+    return build_store()
+
 
 try:
-    sheet = client.open(SPREADSHEET_NAME)
-except:
+    store = get_cached_store()
+except SpreadsheetMissing:
     st.error("Cannot find 'Branch Talk Tracker' sheet. Please create it with 'Members' and 'Talks' tabs.")
     st.stop()
+except StoreError as exc:
+    st.error(str(exc))
+    st.stop()
+except Exception as exc:
+    st.error(f"Could not open the branch data store: {exc}")
+    st.stop()
 
-members_ws = sheet.worksheet("Members") if "Members" in [ws.title for ws in sheet.worksheets()] else sheet.add_worksheet("Members", 200, 5)
-talks_ws = sheet.worksheet("Talks") if "Talks" in [ws.title for ws in sheet.worksheets()] else sheet.add_worksheet("Talks", 1000, 6)
+if store.kind == "sqlite":
+    st.sidebar.caption("This session is storing data in a local database.")
 
-if len(members_ws.get_all_values()) == 0:
-    members_ws.append_row(["full_name", "category", "is_active"])
-if len(talks_ws.get_all_values()) == 0:
-    talks_ws.append_row(["talk_date", "full_name", "topic", "status", "speaker_number"])
 
 def load_members():
-    data = members_ws.get_all_records()
-    df = pd.DataFrame(data)
-    return df if not df.empty else pd.DataFrame(columns=["full_name", "category", "is_active"])
+    return store.load_members()
 
-def load_talks():
-    data = talks_ws.get_all_records()
-    df = pd.DataFrame(data)
-    if not df.empty:
-        df["talk_date"] = pd.to_datetime(df["talk_date"])
-    return df if not df.empty else pd.DataFrame(columns=["talk_date", "full_name", "topic", "status", "speaker_number"])
 
 def save_members(df):
-    members_ws.clear()
-    members_ws.append_row(["full_name", "category", "is_active"])
-    if not df.empty:
-        members_ws.append_rows(df.values.tolist())
+    store.save_members(df)
+
+
+def load_talks():
+    return store.load_talks()
+
 
 def save_talks(df):
-    talks_ws.clear()
-    talks_ws.append_row(["talk_date", "full_name", "topic", "status", "speaker_number"])
-    if not df.empty:
-        talks_ws.append_rows(df.values.tolist())
+    store.save_talks(df)
+
+
+def pretty_date(value):
+    parsed = to_date(value)
+    if parsed is None:
+        return ""
+    return f"{parsed.strftime('%b')} {parsed.day}, {parsed.year}"
+
+
+def sync_new_event_end():
+    if not st.session_state.get("new_end_touched"):
+        st.session_state.new_end = st.session_state.new_start
+    elif st.session_state.new_end < st.session_state.new_start:
+        st.session_state.new_end = st.session_state.new_start
+
+
+def mark_new_event_end_touched():
+    st.session_state.new_end_touched = True
+    if st.session_state.new_end < st.session_state.new_start:
+        st.session_state.new_end = st.session_state.new_start
+
+
+def event_chip_html(events, day):
+    rows = events_on_day(events, day)
+    if rows.empty:
+        return ""
+    chips = []
+    for row in rows.itertuples(index=False):
+        title = html.escape(str(row.title))
+        span = event_span(row.start_date, row.end_date)
+        range_html = ""
+        tooltip = title
+        if span and span[0] != span[1]:
+            label = format_span_label(span[0], span[1])
+            tooltip = html.escape(f"{row.title} ({label})")
+            range_html = f"<span class='event-range'>{html.escape(label)}</span>"
+        chips.append(f"<span class='event-name' title='{tooltip}'>{title}{range_html}</span>")
+    return "".join(chips)
+
+
+def render_events_page():
+    st.markdown('<p class="medium-font">Branch Events</p>', unsafe_allow_html=True)
+    st.write(
+        "Add a branch activity with a start date and an end date. "
+        "A one-day event uses the same date for both. "
+        "The end date is included, so a Nauvoo trip shows on every day it covers."
+    )
+    flash = st.session_state.pop("flash", None)
+    if flash:
+        st.markdown(f'<p class="success-msg">{html.escape(flash)}</p>', unsafe_allow_html=True)
+    if st.session_state.pop("clear_new_event_text", False):
+        st.session_state.new_event_title = ""
+        st.session_state.new_event_notes = ""
+    if st.session_state.pop("reset_event_editor", False):
+        st.session_state.pop("event_to_edit", None)
+        st.session_state.pending_delete = None
+
+    today = date.today()
+    if "new_start" not in st.session_state:
+        st.session_state.new_start = today
+    if "new_end" not in st.session_state:
+        st.session_state.new_end = st.session_state.new_start
+    if "new_end_touched" not in st.session_state:
+        st.session_state.new_end_touched = False
+    if "new_event_title" not in st.session_state:
+        st.session_state.new_event_title = ""
+    if "new_event_notes" not in st.session_state:
+        st.session_state.new_event_notes = ""
+
+    st.subheader("Add an Event")
+    st.text_input("Event name", key="new_event_title", placeholder="Nauvoo Trip")
+    col1, col2 = st.columns(2)
+    with col1:
+        st.date_input("Start date", key="new_start", on_change=sync_new_event_end)
+    with col2:
+        st.date_input("End date", key="new_end", on_change=mark_new_event_end_touched)
+    st.text_input("Notes (optional)", key="new_event_notes", placeholder="Meet at the chapel")
+    day_count = inclusive_day_count(st.session_state.new_start, st.session_state.new_end)
+    if day_count == 1:
+        st.caption("This event will show on 1 day.")
+    elif day_count > 1:
+        st.caption(f"This event will show on {day_count} days, including the end date.")
+    if st.button("➕ Add This Event", use_container_width=True):
+        try:
+            store.add_event(
+                st.session_state.new_event_title,
+                st.session_state.new_start,
+                st.session_state.new_end,
+                st.session_state.new_event_notes,
+            )
+        except EventValidationError as exc:
+            st.error(str(exc))
+        else:
+            name = st.session_state.new_event_title.strip()
+            st.session_state.flash = f"Added {name}."
+            st.session_state.clear_new_event_text = True
+            st.session_state.reset_event_editor = True
+            st.rerun()
+
+    events = store.load_events()
+    st.subheader("Existing Events")
+    if events.empty:
+        st.info("No events yet.")
+        return
+
+    ordered = events.copy()
+    ordered["_sort"] = ordered["start_date"].map(lambda value: to_date(value) or date.max)
+    ordered = ordered.sort_values(["_sort", "title"], kind="mergesort")
+    show = pd.DataFrame(
+        {
+            "Event": ordered["title"],
+            "Starts": ordered["start_date"].map(pretty_date),
+            "Ends": ordered["end_date"].map(pretty_date),
+            "Days": [
+                inclusive_day_count(start, end)
+                for start, end in zip(ordered["start_date"], ordered["end_date"])
+            ],
+            "Notes": ordered["notes"],
+        }
+    )
+    st.dataframe(show, use_container_width=True, hide_index=True)
+
+    labels = {
+        str(row.event_id): f"{row.title} — {pretty_date(row.start_date)} to {pretty_date(row.end_date)}"
+        for row in ordered.itertuples(index=False)
+    }
+    selected_id = st.selectbox(
+        "Select an event to edit or delete",
+        list(labels),
+        format_func=lambda event_id: labels[event_id],
+        key="event_to_edit",
+    )
+    selected = events.loc[events["event_id"].astype(str) == str(selected_id)].iloc[0]
+    title_key = f"edit_title_{selected_id}"
+    start_key = f"edit_start_{selected_id}"
+    end_key = f"edit_end_{selected_id}"
+    notes_key = f"edit_notes_{selected_id}"
+    if title_key not in st.session_state:
+        title_value = selected["title"]
+        st.session_state[title_key] = "" if pd.isna(title_value) else str(title_value)
+    if start_key not in st.session_state:
+        st.session_state[start_key] = to_date(selected["start_date"]) or today
+    if end_key not in st.session_state:
+        st.session_state[end_key] = to_date(selected["end_date"]) or st.session_state[start_key]
+    if notes_key not in st.session_state:
+        notes_value = selected["notes"]
+        st.session_state[notes_key] = "" if pd.isna(notes_value) else str(notes_value)
+
+    st.subheader("Edit Event")
+    st.text_input("Event name", key=title_key)
+    edit_cols = st.columns(2)
+    with edit_cols[0]:
+        st.date_input("Start date", key=start_key)
+    with edit_cols[1]:
+        st.date_input("End date", key=end_key)
+    st.text_input("Notes (optional)", key=notes_key)
+    edit_count = inclusive_day_count(st.session_state[start_key], st.session_state[end_key])
+    if edit_count == 1:
+        st.caption("This event will show on 1 day.")
+    elif edit_count > 1:
+        st.caption(f"This event will show on {edit_count} days, including the end date.")
+    else:
+        st.caption("End date must be on or after the start date.")
+
+    save_col, delete_col = st.columns(2)
+    with save_col:
+        if st.button("Save Changes", use_container_width=True):
+            try:
+                store.update_event(
+                    selected_id,
+                    st.session_state[title_key],
+                    st.session_state[start_key],
+                    st.session_state[end_key],
+                    st.session_state[notes_key],
+                )
+            except EventValidationError as exc:
+                st.error(str(exc))
+            else:
+                st.session_state.flash = "Event saved."
+                st.rerun()
+    with delete_col:
+        if st.button("Delete Event", use_container_width=True):
+            st.session_state.pending_delete = str(selected_id)
+
+    if str(st.session_state.get("pending_delete")) == str(selected_id):
+        st.warning("Delete this event? It will disappear from every day it covers.")
+        confirm_col, keep_col = st.columns(2)
+        with confirm_col:
+            if st.button("Confirm Delete", use_container_width=True):
+                try:
+                    store.delete_event(selected_id)
+                except EventValidationError as exc:
+                    st.error(str(exc))
+                else:
+                    st.session_state.flash = "Event deleted."
+                    st.session_state.reset_event_editor = True
+                    st.rerun()
+        with keep_col:
+            if st.button("Keep Event", use_container_width=True):
+                st.session_state.pending_delete = None
+                st.rerun()
+
 
 # Sidebar
 st.sidebar.markdown("### Navigation")
 min_months = st.sidebar.slider("Minimum months between talks", 3, 12, 4)
 show_category = st.sidebar.radio("Show", ["All Members", "Adults Only", "Youth Only"])
 
-menu = st.sidebar.radio("Choose a page:", 
-    ["🏠 Home & Suggestions", 
-     "👥 Add Members", 
-     "📅 Schedule or Record Talks", 
-     "📆 Calendar View", 
-     "📊 Monthly Report"])
+menu = st.sidebar.radio(
+    "Choose a page:",
+    [
+        "🏠 Home & Suggestions",
+        "👥 Add Members",
+        "📅 Schedule or Record Talks",
+        "📌 Branch Events",
+        "📆 Calendar View",
+        "📊 Monthly Report",
+    ],
+)
 
 # ====================== HOME & SUGGESTIONS ======================
 if menu == "🏠 Home & Suggestions":
@@ -129,7 +358,7 @@ if menu == "🏠 Home & Suggestions":
 # ====================== ADD MEMBERS ======================
 elif menu == "👥 Add Members":
     st.markdown('<p class="medium-font">Add Branch Members</p>', unsafe_allow_html=True)
-    
+
     members = load_members()
     if not members.empty:
         st.dataframe(members[["full_name", "category"]], use_container_width=True, hide_index=True)
@@ -203,10 +432,19 @@ elif menu == "📅 Schedule or Record Talks":
             save_talks(talks)
             st.markdown(f'<p class="success-msg">✅ Speaker {i} saved for {talk_date.strftime("%B %d, %Y")}!</p>', unsafe_allow_html=True)
 
+# ====================== BRANCH EVENTS ======================
+elif menu == "📌 Branch Events":
+    render_events_page()
+
 # ====================== CALENDAR VIEW (Clean Google Calendar style + selection box) ======================
 elif menu == "📆 Calendar View":
     st.markdown('<p class="medium-font">📆 Monthly Calendar</p>', unsafe_allow_html=True)
+    st.caption(
+        "Green labels are branch events. A multi-day event is listed on every day from its start date through its end date. "
+        "Add or change events on the Branch Events page."
+    )
     talks = load_talks()
+    events = store.load_events()
 
     # Set Sunday as first day of the week
     cal_module.setfirstweekday(cal_module.SUNDAY)
@@ -219,15 +457,18 @@ elif menu == "📆 Calendar View":
         if st.button("← Previous Month", use_container_width=True):
             st.session_state.calendar_month -= timedelta(days=32)
             st.session_state.calendar_month = st.session_state.calendar_month.replace(day=1)
+            st.rerun()
     with col2:
         st.markdown(f"<h2 style='text-align:center; color:#1a73e8;'>{st.session_state.calendar_month.strftime('%B %Y')}</h2>", unsafe_allow_html=True)
     with col3:
         if st.button("Next Month →", use_container_width=True):
             st.session_state.calendar_month += timedelta(days=32)
             st.session_state.calendar_month = st.session_state.calendar_month.replace(day=1)
+            st.rerun()
     with col4:
         if st.button("Today", use_container_width=True):
             st.session_state.calendar_month = datetime.today().replace(day=1)
+            st.rerun()
 
     current = st.session_state.calendar_month
     cal = cal_module.monthcalendar(current.year, current.month)
@@ -244,6 +485,9 @@ elif menu == "📆 Calendar View":
                     label = f"{current.strftime('%b')} {d} — {sp_names}"
                 else:
                     label = f"{current.strftime('%b')} {d} — Open"
+                event_names = titles_on_day(events, date(current.year, current.month, d))
+                if event_names:
+                    label += " | " + ", ".join(event_names)
                 sundays_this_month.append((date_str, label))
 
     # Selection box (dropdown) at the top
@@ -274,31 +518,60 @@ elif menu == "📆 Calendar View":
                 continue
 
             date_obj = datetime(current.year, current.month, day)
-            date_str = date_obj.strftime("%Y-%m-%d")
             is_sunday = date_obj.weekday() == 6
             is_first_sunday = (day == min([d for week in cal for d in week if d > 0 and datetime(current.year, current.month, d).weekday() == 6], default=0))
+            info = describe_day(
+                date_obj,
+                talks,
+                events,
+                is_sunday=is_sunday,
+                is_first_sunday=is_first_sunday,
+            )
 
-            day_talks = talks[talks["talk_date"].dt.strftime("%Y-%m-%d") == date_str] if not talks.empty else pd.DataFrame()
-
-            if not is_sunday:
-                content = f"{day}<br><span class='open-text'>—</span>"
-                extra = ""
-            elif is_first_sunday:
-                content = f"{day}<br><strong>Fast & Testimony Meeting</strong>"
+            if info["fast_sunday"]:
+                body = "<strong>Fast & Testimony Meeting</strong>"
                 extra = "fast-sunday"
+            elif info["speakers"]:
+                body = "<br>".join(
+                    [f"<span class='speaker'>• {html.escape(str(speaker))}</span>" for speaker in info["speakers"]]
+                )
+                extra = "has-talk"
+            elif info["open_sunday"]:
+                body = "<span class='open-text'>— Open —</span>"
+                extra = "has-event" if info["titles"] else ""
+            elif info["titles"]:
+                body = ""
+                extra = "has-event"
             else:
-                if not day_talks.empty:
-                    speakers = day_talks.sort_values("speaker_number")["full_name"].tolist()
-                    content = f"{day}<br>" + "<br>".join([f"<span class='speaker'>• {s}</span>" for s in speakers])
-                    extra = "has-talk"
-                else:
-                    content = f"{day}<br><span class='open-text'>— Open —</span>"
-                    extra = ""
+                body = "<span class='open-text'>—</span>"
+                extra = ""
 
+            chips = event_chip_html(events, date_obj)
+            content = f"{day}<br>{body}{chips}"
             row_cols[i].markdown(
                 f'<div class="calendar-day {extra}"><span class="date-number">{content}</span></div>',
                 unsafe_allow_html=True
             )
+
+    month_start, month_end = month_bounds(current.year, current.month)
+    month_events = events_overlapping(events, month_start, month_end)
+    st.subheader("Events this month")
+    if month_events.empty:
+        st.info("No branch events this month.")
+    else:
+        month_table = pd.DataFrame(
+            {
+                "Event": month_events["title"],
+                "Starts": month_events["start_date"].map(pretty_date),
+                "Ends": month_events["end_date"].map(pretty_date),
+                "Days": [
+                    inclusive_day_count(start, end)
+                    for start, end in zip(month_events["start_date"], month_events["end_date"])
+                ],
+                "Notes": month_events["notes"],
+            }
+        )
+        st.dataframe(month_table, use_container_width=True, hide_index=True)
 
     # Form appears below the calendar when a Sunday is selected
     if "selected_date" in st.session_state:

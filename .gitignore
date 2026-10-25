@@ -1,0 +1,6 @@
+credentials.json
+*.db
+__pycache__/
+.streamlit/secrets.toml
+Madisonville_Talk_Report.csv
+.pytest_cache/
